@@ -1,0 +1,347 @@
+name: Controlled Muyu 6.1.138 Official KSU / SYSVIPC 678 build
+'on':
+  workflow_call:
+    inputs:
+      requested_parameters:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  muyu-single-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      LC_ALL: C.UTF-8
+      BASE_COMMIT: f99f842f61b1ae660badbe97d933b3705916b9f7
+      BASE_URL: https://raw.githubusercontent.com/hanjb51/muyu-gki-baseline/f99f842f61b1ae660badbe97d933b3705916b9f7
+      AUDIT_COMMIT: f1eb6ef510a3576e2aeb4880b62f46511e371772
+      DS_COMMIT: cdadb9eb5d0f86aacffff60776333e6f6b73a30a
+      GOLD_COMMIT: dc0f76bedd790b7738e5695509297ee71ca4a2c2
+      KSU_COMMIT: 64833c005eca6a8dc3d73ec2d37d84c37e0d9ad2
+      AK_COMMIT: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
+      PATCH_SHA: 47fc945b2d73d9737d56c0f1c3a74cda0a95c30f9dc1b1abe546fa48940c4460
+    steps:
+    - name: Checkout the exact control commit
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        persist-credentials: false
+    - name: Initialize immutable experiment inputs and validate backend parameters
+      env:
+        REQUESTED_PARAMETERS: ${{ inputs.requested_parameters }}
+      shell: bash
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/evidence/logs" "$GITHUB_WORKSPACE/release" "$GITHUB_WORKSPACE/kernel"
+        echo "SRC=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
+        echo "EVID=$GITHUB_WORKSPACE/evidence" >> "$GITHUB_ENV"
+        echo "REPO=$RUNNER_TEMP/muyu-repo" >> "$GITHUB_ENV"
+        python3 <<'PY'
+        import json,os
+        from pathlib import Path
+        p=json.loads(os.environ['REQUESTED_PARAMETERS'])
+        expect={'android_version':'android14','kernel_version':'6.1','sub_level':'138','os_patch_level':'2025-06','ksu_variant':'Official','ksu_mode':'禁用SUSFS','droidspaces':'678','artifact_upload_mode':'仅上传 AnyKernel3.zip','use_kpm':'disabled (关闭)','enable_susfs':False,'muyu_678_experiment':True}
+        expect.update({k:False for k in ['use_zram','use_bbg','use_rekernel','use_nomount','use_networking','cve_2026_43499_patch','supp_op','droidspaces_ntsync']})
+        assert all(p.get(k)==v for k,v in expect.items()),p
+        r=Path('evidence');(r/'requested-parameters.json').write_text(json.dumps(p,ensure_ascii=False,indent=2)+'\n')
+        (r/'run.json').write_text(json.dumps({'repository':os.environ['GITHUB_REPOSITORY'],'control_commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'run_url':f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",'acceptance':'NOT_ACCEPTED until separately audited'},indent=2)+'\n')
+        PY
+    - name: Install host tools; reclaim space on the disposable hosted runner
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+        sudo apt-get update
+        sudo apt-get install -y git curl rsync cpio kmod build-essential libssl-dev libelf-dev openssl lz4 xz-utils zstd bison flex bc libtinfo5 libncurses-dev python3 python3-pyelftools dwarves zip
+        df -h "$GITHUB_WORKSPACE"
+        curl -fLSs --retry 3 "$BASE_URL/tools/repo" -o "$REPO"
+        echo '05f571deafd6ed6da0d20fa707dde29aa5624dbf35553d697a40dbdd4c8d178a  '"$REPO" | sha256sum -c -
+        curl -fLSs --retry 3 "$BASE_URL/source-lock/manifest.xml" -o "$EVID/expected-manifest.xml"
+        echo 'b48894a34ab86306704fec559d5a2f82a26438ad6c68520650dcc3763834d53c  '"$EVID/expected-manifest.xml" | sha256sum -c -
+    - name: Sync only the pinned Google Android14 6.1.138 source set
+      timeout-minutes: 60
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/source-sync.log") 2>&1
+        cd "$SRC"
+        python3 "$REPO" init -u https://github.com/hanjb51/muyu-gki-baseline.git -b "$BASE_COMMIT" -m source-lock/manifest.xml --depth=1 --no-use-superproject --repo-url=https://gerrit.googlesource.com/git-repo --repo-rev=d7c431b9968d928373fe9b463a51d304d3b2c48a
+        python3 "$REPO" sync -c -j4 --no-clone-bundle --no-tags
+        python3 "$REPO" manifest -r -o "$EVID/resolved-manifest.xml"
+        test "$(git -C common rev-parse HEAD)" = 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
+        python3 <<'PY'
+        import re,os,json,subprocess,xml.etree.ElementTree as E,hashlib
+        from pathlib import Path
+        r=Path(os.environ['EVID']);m=Path('common/Makefile').read_text();version='.'.join(re.search(r'^'+k+r'\s*=\s*(\d+)',m,re.M)[1] for k in ['VERSION','PATCHLEVEL','SUBLEVEL']);assert version=='6.1.138',version
+        projects=[]
+        for p in E.parse(r/'expected-manifest.xml').getroot().findall('project'):
+         actual=subprocess.check_output(['git','-C',p.attrib['path'],'rev-parse','HEAD'],text=True).strip();assert actual==p.attrib['revision'],(p.attrib,actual);projects.append({**p.attrib,'actual':actual})
+        (r/'source-commits.json').write_text(json.dumps({'kernel_version':version,'projects':projects},indent=2)+'\n')
+        paths=['BUILD.bazel','build.config.gki','build.config.gki.aarch64','kernel/Makefile','include/linux/android_kabi.h','kernel/module/main.c','kernel/module/signing.c','kernel/module/version.c']
+        paths+=['android/abi_gki_protected_exports_aarch64','android/gki_aarch64_protected_modules']
+        (r/'protected-source-hashes.json').write_text(json.dumps({p:hashlib.sha256((Path('common')/p).read_bytes()).hexdigest() for p in paths},indent=2)+'\n')
+        PY
+        prebuilts/clang/host/linux-x86/clang-r487747c/bin/clang --version | tee "$EVID/logs/toolchain.log"
+    - name: Fetch fixed patch repositories, Official KernelSU and AnyKernel3
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/dependencies.log") 2>&1
+        fetch_checkout() {
+          local url="$1" sha="$2" dest="$3"
+          git init -q "$dest"
+          git -C "$dest" remote add origin "$url"
+          git -C "$dest" fetch --depth=1 origin "$sha"
+          git -C "$dest" checkout --detach FETCH_HEAD
+          test "$(git -C "$dest" rev-parse HEAD)" = "$sha"
+        }
+        fetch_checkout https://github.com/ravindu644/Droidspaces-OSS.git "$DS_COMMIT" "$RUNNER_TEMP/muyu-droidspaces"
+        fetch_checkout https://github.com/Goldzxcbug/Droidspaces_Kernel_patch.git "$GOLD_COMMIT" "$RUNNER_TEMP/muyu-gold"
+        cp "$RUNNER_TEMP/muyu-droidspaces/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" "$EVID/droidspaces-678.patch"
+        cp "$RUNNER_TEMP/muyu-gold/GKI/6.1/GKI-6.1-sysvipc_kabi_6_7_8.patch" "$EVID/goldzxcbug-678.patch"
+        cmp "$EVID/droidspaces-678.patch" "$EVID/goldzxcbug-678.patch"
+        echo "$PATCH_SHA  $EVID/droidspaces-678.patch" | sha256sum -c -
+        echo "$PATCH_SHA  $EVID/goldzxcbug-678.patch" | sha256sum -c -
+        cat "$EVID/droidspaces-678.patch"
+        fetch_checkout https://github.com/tiann/KernelSU.git "$KSU_COMMIT" "$SRC/KernelSU"
+        fetch_checkout https://github.com/WildKernels/AnyKernel3.git "$AK_COMMIT" "$GITHUB_WORKSPACE/AnyKernel3"
+        python3 <<'PY'
+        import os,json
+        from pathlib import Path
+        keys=['DS_COMMIT','GOLD_COMMIT','KSU_COMMIT','AK_COMMIT','PATCH_SHA','BASE_COMMIT']
+        (Path(os.environ['EVID'])/'dependency-lock.json').write_text(json.dumps({k:os.environ[k] for k in keys},indent=2)+'\n')
+        PY
+    - name: Strictly apply or positively identify the exact 678 patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/patch-678.log") 2>&1
+        cd "$SRC/common"
+        PATCH="$EVID/droidspaces-678.patch"
+        test -s "$PATCH"
+        if git apply --check --verbose "$PATCH" > "$EVID/logs/patch-forward-check.log" 2>&1; then
+          git apply --verbose "$PATCH"
+          state=applied
+        elif git apply --reverse --check --verbose "$PATCH" > "$EVID/logs/patch-reverse-check.log" 2>&1; then
+          state=already_applied_confirmed_by_reverse_check
+        else
+          cat "$EVID/logs/patch-forward-check.log" "$EVID/logs/patch-reverse-check.log"
+          echo '::error::678 patch does not apply and is not already applied'
+          exit 1
+        fi
+        git apply --reverse --check "$PATCH"
+        echo "$state" | tee "$EVID/patch-state.txt"
+        python3 <<'PY'
+        import os,re,json,hashlib
+        from pathlib import Path
+        s=Path('include/linux/sched.h').read_text();task=s.split('struct task_struct {',1)[1].split('\n};',1)[0];flat=re.sub(r'\s+',' ',task)
+        assert flat.count('ANDROID_KABI_USE(6, struct sysv_sem sysvsem);')==1
+        assert flat.count('_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);')==1
+        assert not re.search(r'^\s*struct sysv_(sem|shm)\s+sysv(sem|shm)\s*;',task,re.M)
+        assert not re.search(r'ANDROID_KABI_USE\(\s*[78]\s*,',task)
+        assert 'ANDROID_KABI_USE(1, unsigned int saved_state);' in task
+        out=Path(os.environ['EVID']);(out/'patched-sched.h').write_text(s);(out/'padding-source-check.json').write_text(json.dumps({'mapping':{'sysvsem':[6],'sysvshm':[7,8]},'saved_state_slot_1_preserved':True,'patch_sha256':hashlib.sha256((out/'droidspaces-678.patch').read_bytes()).hexdigest()},indent=2)+'\n')
+        PY
+        git diff -- include/linux/sched.h > "$EVID/sysvipc-applied.diff"
+    - name: Integrate pinned Official KernelSU and only the requested feature fragment
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/integration.log") 2>&1
+        cd "$SRC"
+        test "$(git -C KernelSU rev-parse HEAD)" = "$KSU_COMMIT"
+        # The three driver wiring operations from the audited Official setup.sh,
+        # without its mutable git-pull and fallback-checkout behavior.
+        test ! -e common/drivers/kernelsu
+        ln -s "$(realpath --relative-to=common/drivers KernelSU/kernel)" common/drivers/kernelsu
+        printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> common/drivers/Makefile
+        sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' common/drivers/Kconfig
+        cp KernelSU/kernel/Kconfig "$EVID/Official-KernelSU.Kconfig"
+        cp KernelSU/kernel/setup.sh "$EVID/Official-KernelSU-setup-reference.sh"
+        cat > common/arch/arm64/configs/muyu678.fragment <<'EOF'
+        CONFIG_SYSVIPC=y
+        CONFIG_POSIX_MQUEUE=y
+        CONFIG_IPC_NS=y
+        CONFIG_PID_NS=y
+        CONFIG_DEVTMPFS=y
+        CONFIG_USER_NS=y
+        CONFIG_KSU=y
+        EOF
+        cp common/arch/arm64/configs/muyu678.fragment "$EVID/requested.fragment"
+        cp common/init/Kconfig "$EVID/init.Kconfig"
+        cp common/drivers/base/Kconfig "$EVID/drivers-base.Kconfig"
+        git -C common diff > "$EVID/common-source.diff"
+        python3 <<'PY'
+        import json,hashlib,os
+        from pathlib import Path
+        r=Path(os.environ['EVID']);expected=json.loads((r/'protected-source-hashes.json').read_text());assert all(hashlib.sha256((Path('common')/p).read_bytes()).hexdigest()==v for p,v in expected.items())
+        assert 'kmi_symbol_list_strict_mode": True' in Path('common/BUILD.bazel').read_text()
+        assert '$(obj)/config_data: $(KCONFIG_CONFIG) FORCE' in Path('common/kernel/Makefile').read_text()
+        PY
+    - name: Generate actual Kconfig output and enforce all requested dependencies before compiling
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/config-generation.log") 2>&1
+        cd "$SRC"
+        FLAGS=(--config=stamp --lto=thin --defconfig_fragment=//common:arch/arm64/configs/muyu678.fragment)
+        tools/bazel build "${FLAGS[@]}" //common:kernel_aarch64_config
+        tools/bazel cquery "${FLAGS[@]}" //common:kernel_aarch64_config --output=files > "$EVID/config-output-paths.txt"
+        python3 <<'PY'
+        from pathlib import Path
+        import os,json,hashlib
+        r=Path(os.environ['EVID']);choices=[]
+        for line in (r/'config-output-paths.txt').read_text().splitlines():
+         p=Path(line)
+         if p.is_dir():choices.extend(x for x in p.rglob('.config') if x.is_file())
+         elif p.is_file() and p.name=='.config':choices.append(p)
+        assert choices,'Generated .config not found'
+        assert len({hashlib.sha256(p.read_bytes()).hexdigest() for p in choices})==1,'Conflicting generated configurations'
+        b=choices[0].read_bytes();(r/'generated.config').write_bytes(b)
+        d=dict(l.split('=',1) for l in b.decode().splitlines() if l.startswith('CONFIG_') and '=' in l)
+        required='SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS USER_NS KSU NAMESPACES NET KPROBES EXT4_FS MODVERSIONS MODULE_SIG MODULE_SIG_PROTECT MODULE_SIG_ALL'.split()
+        assert all(d.get('CONFIG_'+k)=='y' for k in required),{k:d.get('CONFIG_'+k) for k in required}
+        for k in ['KSU_SUSFS','KPM','NTSYNC','MODULE_SIG_FORCE']:
+         assert d.get('CONFIG_'+k) not in ['y','m'],k
+        (r/'precompile-config-check.json').write_text(json.dumps({'status':'PASS','config_sha256':hashlib.sha256(b).hexdigest(),'required':{k:d['CONFIG_'+k] for k in required},'dependency_resolution':'Actual Kleaf generated .config; not defconfig text'},indent=2)+'\n')
+        PY
+    - name: Compile only the single requested kernel and companion modules with KMI protection intact
+      id: compile
+      continue-on-error: true
+      timeout-minutes: 100
+      shell: bash
+      run: |
+        set -uo pipefail
+        set +e
+        cd "$SRC"
+        tools/bazel run --config=stamp --lto=thin --defconfig_fragment=//common:arch/arm64/configs/muyu678.fragment //common:kernel_aarch64_dist -- --dist_dir="$EVID/dist" |& tee "$EVID/logs/kernel-build.log"
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > "$EVID/compile-exit-code.txt"
+        exit "$rc"
+    - name: Run the enforced upstream ABI target without rewriting ABI baselines
+      id: abi
+      if: steps.compile.outcome == 'success'
+      continue-on-error: true
+      timeout-minutes: 35
+      shell: bash
+      run: |
+        set -uo pipefail
+        set +e
+        cd "$SRC"
+        tools/bazel run --config=stamp --lto=thin --defconfig_fragment=//common:arch/arm64/configs/muyu678.fragment //common:kernel_aarch64_abi_dist -- --dist_dir="$EVID/abi-dist" |& tee "$EVID/logs/upstream-abi.log"
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > "$EVID/upstream-abi-exit-code.txt"
+        exit "$rc"
+    - name: Preserve real config, Module.symvers, BTF layout, source protections and every reject
+      id: collect
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 <<'PY'
+        from pathlib import Path
+        import os,json,hashlib,gzip,shutil,subprocess,struct
+        from elftools.elf.elffile import ELFFile
+        r=Path(os.environ['EVID']);src=Path(os.environ['SRC']);rejects=[]
+        if (r/'abi-dist').is_dir():
+         for p in (r/'abi-dist').rglob('*'):
+          if p.is_file() and p.stat().st_size<40*1024*1024 and (p.name.startswith('abi') or p.suffix in ['.stg','.report']):
+           dest=r/'abi-reports'/p.relative_to(r/'abi-dist');dest.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(p,dest)
+        for p in src.rglob('*.rej'):
+         rel=p.relative_to(src);out=r/'rejects'/rel;out.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(p,out);rejects.append({'path':str(rel),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+        (r/'all-rejects.json').write_text(json.dumps(rejects,indent=2)+'\n')
+        if (r/'protected-source-hashes.json').exists():
+         old=json.loads((r/'protected-source-hashes.json').read_text());checks={p:hashlib.sha256((src/'common'/p).read_bytes()).hexdigest()==v for p,v in old.items()};(r/'protected-source-postcheck.json').write_text(json.dumps(checks,indent=2)+'\n');assert all(checks.values()),checks
+        if not (r/'dist/Image').exists():
+         (r/'result.json').write_text(json.dumps({'compilation':'NO_IMAGE','OEM_acceptance':'NOT_ACCEPTED'},indent=2)+'\n');raise SystemExit(0)
+        b=(r/'dist/Image').read_bytes();a=b.find(b'IKCFG_ST');z=b.find(b'IKCFG_ED',a);assert a>=0 and z>a
+        cfg=gzip.decompress(b[a+8:z]);(r/'final.config').write_bytes(cfg)
+        d=dict(l.split('=',1) for l in cfg.decode().splitlines() if l.startswith('CONFIG_') and '=' in l)
+        for k in 'SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS USER_NS KSU MODVERSIONS MODULE_SIG MODULE_SIG_PROTECT MODULE_SIG_ALL'.split():assert d.get('CONFIG_'+k)=='y',k
+        for k in ['KSU_SUSFS','KPM','NTSYNC','MODULE_SIG_FORCE']:assert d.get('CONFIG_'+k) not in ['y','m'],k
+        sv=list((r/'dist').glob('*Module.symvers'))
+        if not sv:
+         cp=subprocess.run(['tools/bazel','cquery','--config=stamp','--lto=thin','--defconfig_fragment=//common:arch/arm64/configs/muyu678.fragment','//common:kernel_aarch64','--output=files'],cwd=src,text=True,capture_output=True);(r/'cquery-kernel-files.txt').write_text(cp.stdout+cp.stderr);assert cp.returncode==0
+         sv=[src/p for p in cp.stdout.splitlines() if p.endswith('Module.symvers') and (src/p).is_file()]
+        assert sv,'Complete Module.symvers missing';assert len({hashlib.sha256(p.read_bytes()).hexdigest() for p in sv})==1
+        shutil.copy2(sv[0],r/'Module.symvers')
+        v=r/'dist/vmlinux'
+        if v.exists():
+         with v.open('rb') as f:
+          elf=ELFFile(f);sec=elf.get_section_by_name('.BTF');assert sec is not None;(r/'kernel.btf').write_bytes(sec.data())
+          table=elf.get_section_by_name('.symtab');names={'_text','__start___ksymtab','__stop___ksymtab','__start___ksymtab_gpl','__stop___ksymtab_gpl','__start___kcrctab','__start___kcrctab_gpl'};(r/'elf-export-boundaries.json').write_text(json.dumps({s.name:s['st_value'] for s in table.iter_symbols() if s.name in names},indent=2)+'\n')
+         cp=subprocess.run(['pahole','-C','task_struct',str(v)],text=True,capture_output=True);(r/'task_struct-pahole.txt').write_text(cp.stdout+cp.stderr)
+        targets={};symvers={}
+        for line in (r/'Module.symvers').read_text().splitlines():
+         f=line.split()
+         if len(f)>=3 and f[2]=='vmlinux':symvers[f[1]]=f[0].removeprefix('0x')
+        stock={'__page_file_index':'12d686c5','add_swap_extent':'3da4a325','page_swap_info':'138a96b6','unuse_swap_pte':'2dd1c10f'}
+        for k,v in stock.items():targets[k]={'stock':v,'candidate':symvers.get(k),'match':symvers.get(k)==v}
+        (r/'four-oem-crc-check.json').write_text(json.dumps({'provenance':'Phase4 raw Image export extraction, f1eb6ef510a3576e2aeb4880b62f46511e371772 report','targets':targets,'cifs_imports':['__page_file_index','add_swap_extent'],'complete_OEM_acceptance':False},indent=2)+'\n')
+        (r/'Image.sha256').write_text(hashlib.sha256(b).hexdigest()+'  Image\n')
+        (r/'config-from-Image-verified.txt').write_text('All six requested features + Official KSU + MODVERSIONS/MODULE_SIG/PROTECT verified from actual Image.\n')
+        (r/'result.json').write_text(json.dumps({'Image_sha256':hashlib.sha256(b).hexdigest(),'final_config_sha256':hashlib.sha256(cfg).hexdigest(),'compilation_exit':(r/'compile-exit-code.txt').read_text().strip() if (r/'compile-exit-code.txt').exists() else 'UNKNOWN','upstream_ABI_exit':(r/'upstream-abi-exit-code.txt').read_text().strip() if (r/'upstream-abi-exit-code.txt').exists() else 'NOT_RUN','OEM_acceptance':'NOT_ACCEPTED: full stock CRC/BTF/trust offline audit remains required','all_reject_count':len(rejects)},indent=2)+'\n')
+        PY
+    - name: Package only AnyKernel3.zip; never create boot images or a Release
+      if: steps.compile.outcome == 'success' && steps.collect.outcome == 'success'
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -f "$EVID/config-from-Image-verified.txt"
+        cp "$EVID/dist/Image" "$GITHUB_WORKSPACE/AnyKernel3/Image"
+        python3 <<'PY'
+        from pathlib import Path
+        import os,zipfile,hashlib
+        root=Path(os.environ['GITHUB_WORKSPACE']);ak=root/'AnyKernel3';dst=root/'release/AnyKernel3-muyu-6.1.138-Official-678.zip'
+        (ak/'CANDIDATE-NOT-ACCEPTED.txt').write_text('Experimental muyu SYSVIPC 678 candidate. Compilation is not OEM module compatibility acceptance. No flashing performed. Review evidence first.\n')
+        with zipfile.ZipFile(dst,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+         for p in sorted(ak.rglob('*')):
+          if p.is_file() and '.git' not in p.relative_to(ak).parts:z.write(p,p.relative_to(ak).as_posix())
+        (Path(os.environ['EVID'])/'AnyKernel3.sha256').write_text(hashlib.sha256(dst.read_bytes()).hexdigest()+'  '+dst.name+'\n')
+        print(dst.name,hashlib.sha256(dst.read_bytes()).hexdigest())
+        PY
+    - name: Seal all non-private audit evidence
+      if: always()
+      shell: bash
+      run: |
+        python3 <<'PY'
+        from pathlib import Path
+        import os,hashlib
+        r=Path(os.environ['EVID']);lines=[]
+        for p in sorted(r.rglob('*')):
+         if not p.is_file() or p.name=='SHA256SUMS' or 'dist' in p.relative_to(r).parts or 'abi-dist' in p.relative_to(r).parts:continue
+         if p.name.endswith('.key') or p.name=='signing_key.pem':raise RuntimeError('Unexpected private key in evidence')
+         lines.append(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(r).as_posix())
+        (r/'SHA256SUMS').write_text('\n'.join(lines)+'\n')
+        PY
+    - name: Upload the requested AnyKernel3 ZIP only
+      if: always() && steps.compile.outcome == 'success' && steps.collect.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: AnyKernel3-muyu-6.1.138-Official-678-${{ github.run_id }}
+        path: release/*.zip
+        if-no-files-found: error
+        retention-days: 30
+    - name: Preserve required config, manifest, hashes, rejects and compilation/ABI logs on all outcomes
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: Evidence-muyu-6.1.138-678-${{ github.run_id }}
+        path: |-
+          evidence/
+          !evidence/dist/
+          !evidence/abi-dist/
+          !evidence/**/*signing_key.pem
+          !evidence/**/*.key
+        if-no-files-found: error
+        retention-days: 30
+    - name: Report compilation and ABI enforcement failures separately
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat "$EVID/result.json" 2>/dev/null || true
+        test -f "$EVID/compile-exit-code.txt"
+        test "$(cat "$EVID/compile-exit-code.txt")" = 0
+        test -f "$EVID/upstream-abi-exit-code.txt"
+        test "$(cat "$EVID/upstream-abi-exit-code.txt")" = 0
+        test -f "$EVID/config-from-Image-verified.txt"

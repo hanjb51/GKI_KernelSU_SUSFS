@@ -8,6 +8,10 @@ on:
   workflow_call:
     inputs:
       # ==================== 基础配置 ====================
+      muyu_678_experiment:
+        required: false
+        type: boolean
+        default: false
       android_version:
         required: true
         type: string
@@ -99,6 +103,7 @@ on:
 
 jobs:
   build-kernel:
+    if: ${{ !inputs.muyu_678_experiment }}
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1819,3 +1824,10 @@ jobs:
           path: patch-rejects/
           if-no-files-found: ignore
           compression-level: 9
+
+
+  muyu-678-experiment:
+    if: ${{ inputs.muyu_678_experiment }}
+    uses: ./.github/workflows/muyu-678-experiment.yml
+    with:
+      requested_parameters: ${{ toJSON(inputs) }}
