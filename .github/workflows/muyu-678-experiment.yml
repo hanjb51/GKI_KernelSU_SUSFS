@@ -77,7 +77,8 @@ jobs:
          actual=subprocess.check_output(['git','-C',p.attrib['path'],'rev-parse','HEAD'],text=True).strip();assert actual==p.attrib['revision'],(p.attrib,actual);projects.append({**p.attrib,'actual':actual})
         (r/'source-commits.json').write_text(json.dumps({'kernel_version':version,'projects':projects},indent=2)+'\n')
         paths=['BUILD.bazel','build.config.gki','build.config.gki.aarch64','kernel/Makefile','include/linux/android_kabi.h','kernel/module/main.c','kernel/module/signing.c','kernel/module/version.c']
-        paths+=['android/abi_gki_protected_exports_aarch64','android/gki_aarch64_protected_modules']
+        paths+=['android/abi_gki_protected_exports_aarch64','android/gki_aarch64_protected_modules','certs/Makefile','certs/system_certificates.S','certs/system_keyring.c']
+        paths += [str(p.relative_to('common')) for p in Path('common/android').glob('abi_gki_aarch64*') if p.is_file()]
         (r/'protected-source-hashes.json').write_text(json.dumps({p:hashlib.sha256((Path('common')/p).read_bytes()).hexdigest() for p in paths},indent=2)+'\n')
         PY
         prebuilts/clang/host/linux-x86/clang-r487747c/bin/clang --version | tee "$EVID/logs/toolchain.log"
@@ -142,6 +143,48 @@ jobs:
         out=Path(os.environ['EVID']);(out/'patched-sched.h').write_text(s);(out/'padding-source-check.json').write_text(json.dumps({'mapping':{'sysvsem':[6],'sysvshm':[7,8]},'saved_state_slot_1_preserved':True,'patch_sha256':hashlib.sha256((out/'droidspaces-678.patch').read_bytes()).hexdigest()},indent=2)+'\n')
         PY
         git diff -- include/linux/sched.h > "$EVID/sysvipc-applied.diff"
+    - name: Embed only the recovered OEM public certificate and derive Official metadata from complete history
+      shell: bash
+      run: |
+        set -euo pipefail
+        exec > >(tee "$EVID/logs/oem-trust-and-ksu-metadata.log") 2>&1
+        cd "$SRC"
+        curl -fLSs --retry 3 "https://raw.githubusercontent.com/hanjb51/muyu-gki-baseline/$AUDIT_COMMIT/evidence/phase5/oem-public-certificate.pem" -o common/certs/muyu_oem_public.pem
+        echo 'bb6f972d007a1366652f4d478594edae8272a6431ccbdb13f903141f616a1c41  common/certs/muyu_oem_public.pem' | sha256sum -c -
+        openssl x509 -in common/certs/muyu_oem_public.pem -outform DER -out "$EVID/oem-public-certificate.der"
+        echo '1ab85e414a2cdae609f86beb41f172da760df8a72ef486de320bc7c295624505  '"$EVID/oem-public-certificate.der" | sha256sum -c -
+        cp common/certs/muyu_oem_public.pem "$EVID/oem-public-certificate.pem"
+        openssl x509 -in common/certs/muyu_oem_public.pem -noout -subject -issuer -serial -fingerprint -sha256
+        git -C KernelSU fetch --unshallow --filter=blob:none origin "$KSU_COMMIT"
+        test "$(git -C KernelSU rev-parse --is-shallow-repository)" = false
+        test "$(git -C KernelSU rev-parse HEAD)" = "$KSU_COMMIT"
+        git -C KernelSU fsck --connectivity-only --no-dangling
+        git -C KernelSU rev-list --parents HEAD > "$EVID/Official-reachable-commit-graph.txt"
+        git -C KernelSU rev-list --count HEAD | tee "$EVID/Official-reachable-commit-count.txt"
+        cp KernelSU/kernel/Kbuild "$EVID/Official-Kbuild.before"
+        python3 <<'PY'
+        import os,json,hashlib,re
+        from pathlib import Path
+        r=Path(os.environ['EVID']);count=int((r/'Official-reachable-commit-count.txt').read_text());graph=(r/'Official-reachable-commit-graph.txt').read_text().splitlines()
+        assert count==len(graph) and count>1
+        assert graph[0].split()[0]==os.environ['KSU_COMMIT']
+        assert len({l.split()[0] for l in graph})==count
+        nodes={l.split()[0] for l in graph};assert all(p in nodes for l in graph for p in l.split()[1:]),'Incomplete ancestry'
+        version=30000+count;assert version>=32513
+        p=Path('KernelSU/kernel/Kbuild');s=p.read_text();marker='# Calculate version if git version is available';assert s.count(marker)==1
+        # Hermetic Kleaf excludes .git; use verified immutable inputs rather than a guessed fallback.
+        s=s.replace(marker,'include $(KSU_KERNEL_DIR)/muyu-source-version.mk\n\n'+marker)
+        p.write_text(s)
+        metadata=f'# Derived from complete reachable history; not a version override guess.\nKSU_GIT_VERSION := {count}\nKSU_GIT_VERSION_VALID := 1\n'
+        Path('KernelSU/kernel/muyu-source-version.mk').write_text(metadata)
+        (r/'Official-source-version.mk').write_text(metadata)
+        (r/'Official-version.json').write_text(json.dumps({'source_commit':os.environ['KSU_COMMIT'],'reachable_commit_count':count,'KSU_VERSION':version,'formula':'30000 + reachable commit count, upstream Kbuild','graph_sha256':hashlib.sha256((r/'Official-reachable-commit-graph.txt').read_bytes()).hexdigest(),'Manager_minimum':32513,'UAPI':6,'Manager_package':'me.weishu.kernelsu','Manager_certificate_hash':'c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6','runtime_validation':False},indent=2)+'\n')
+        PY
+        git -C KernelSU diff -- kernel/Kbuild > "$EVID/Official-metadata.diff"
+        cp KernelSU/kernel/Kbuild "$EVID/Official-Kbuild.after"
+        cp KernelSU/uapi/supercall.h "$EVID/Official-uapi-supercall.h"
+        cp KernelSU/manager/app/src/main/java/me/weishu/kernelsu/Natives.kt "$EVID/Official-Manager-Natives.kt"
+        cp KernelSU/kernel/supercall/dispatch.c "$EVID/Official-supercall-dispatch.c"
     - name: Integrate pinned Official KernelSU and only the requested feature fragment
       shell: bash
       run: |
@@ -165,6 +208,7 @@ jobs:
         CONFIG_DEVTMPFS=y
         CONFIG_USER_NS=y
         CONFIG_KSU=y
+        CONFIG_SYSTEM_TRUSTED_KEYS="certs/muyu_oem_public.pem"
         EOF
         cp common/arch/arm64/configs/muyu678.fragment "$EVID/requested.fragment"
         cp common/init/Kconfig "$EVID/init.Kconfig"
@@ -198,6 +242,7 @@ jobs:
         assert len({hashlib.sha256(p.read_bytes()).hexdigest() for p in choices})==1,'Conflicting generated configurations'
         b=choices[0].read_bytes();(r/'generated.config').write_bytes(b)
         d=dict(l.split('=',1) for l in b.decode().splitlines() if l.startswith('CONFIG_') and '=' in l)
+        assert d.get('CONFIG_SYSTEM_TRUSTED_KEYS')=='"certs/muyu_oem_public.pem"'
         required='SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS USER_NS KSU NAMESPACES NET KPROBES EXT4_FS MODVERSIONS MODULE_SIG MODULE_SIG_PROTECT MODULE_SIG_ALL'.split()
         assert all(d.get('CONFIG_'+k)=='y' for k in required),{k:d.get('CONFIG_'+k) for k in required}
         for k in ['KSU_SUSFS','KPM','NTSYNC','MODULE_SIG_FORCE']:
@@ -256,6 +301,7 @@ jobs:
         b=(r/'dist/Image').read_bytes();a=b.find(b'IKCFG_ST');z=b.find(b'IKCFG_ED',a);assert a>=0 and z>a
         cfg=gzip.decompress(b[a+8:z]);(r/'final.config').write_bytes(cfg)
         d=dict(l.split('=',1) for l in cfg.decode().splitlines() if l.startswith('CONFIG_') and '=' in l)
+        assert d.get('CONFIG_SYSTEM_TRUSTED_KEYS')=='"certs/muyu_oem_public.pem"'
         for k in 'SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS USER_NS KSU MODVERSIONS MODULE_SIG MODULE_SIG_PROTECT MODULE_SIG_ALL'.split():assert d.get('CONFIG_'+k)=='y',k
         for k in ['KSU_SUSFS','KPM','NTSYNC','MODULE_SIG_FORCE']:assert d.get('CONFIG_'+k) not in ['y','m'],k
         sv=list((r/'dist').glob('*Module.symvers'))
@@ -270,6 +316,28 @@ jobs:
           elf=ELFFile(f);sec=elf.get_section_by_name('.BTF');assert sec is not None;(r/'kernel.btf').write_bytes(sec.data())
           table=elf.get_section_by_name('.symtab');names={'_text','__start___ksymtab','__stop___ksymtab','__start___ksymtab_gpl','__stop___ksymtab_gpl','__start___kcrctab','__start___kcrctab_gpl'};(r/'elf-export-boundaries.json').write_text(json.dumps({s.name:s['st_value'] for s in table.iter_symbols() if s.name in names},indent=2)+'\n')
          cp=subprocess.run(['pahole','-C','task_struct',str(v)],text=True,capture_output=True);(r/'task_struct-pahole.txt').write_text(cp.stdout+cp.stderr)
+         with v.open('rb') as f:
+          elf=ELFFile(f);table=elf.get_section_by_name('.symtab');syms={s.name:s for s in table.iter_symbols()}
+          def readva(addr,n):
+           for sec in elf.iter_sections():
+            if sec['sh_type']!='SHT_NOBITS' and sec['sh_addr']<=addr and addr+n<=sec['sh_addr']+sec['sh_size']:return sec.data()[addr-sec['sh_addr']:addr-sec['sh_addr']+n]
+           raise ValueError((addr,n))
+          sizes={k:struct.unpack('<Q',readva(syms[k]['st_value'],8))[0] for k in ['system_certificate_list_size','module_cert_size']}
+          certlist=readva(syms['system_certificate_list']['st_value'],sizes['system_certificate_list_size']);oem=(r/'oem-public-certificate.der').read_bytes()
+          assert certlist[sizes['module_cert_size']:]==oem,'Expected only OEM additional certificate'
+          assert certlist.count(oem)==1
+          (r/'builtin-certificate-list.der').write_bytes(certlist);(r/'candidate-signing-certificate.der').write_bytes(certlist[:sizes['module_cert_size']])
+          (r/'builtin-certificate-list.json').write_text(json.dumps({**sizes,'OEM_DER_SHA256':hashlib.sha256(oem).hexdigest(),'OEM_in_additional_list':True,'candidate_signer_retained':True,'kernel_keyring_runtime_tested':False},indent=2)+'\n')
+          if 'do_get_info' in syms:
+           sym=syms['do_get_info'];(r/'Official-do_get_info.bin').write_bytes(readva(sym['st_value'],sym['st_size']))
+         objdump=src/'prebuilts/clang/host/linux-x86/clang-r487747c/bin/llvm-objdump'
+         cp=subprocess.run([str(objdump),'--disassemble-symbols=do_get_info',str(v)],text=True,capture_output=True);(r/'Official-do_get_info.disassembly.txt').write_text(cp.stdout+cp.stderr);assert cp.returncode==0
+         samples=sorted((r/'dist').rglob('*.ko'));assert samples,'No own signed module available as positive control'
+         shutil.copy2(samples[0],r/'candidate-signed-module.ko');(r/'candidate-signed-module-source.txt').write_text(str(samples[0].relative_to(r/'dist'))+'\n')
+         version=json.loads((r/'Official-version.json').read_text())['KSU_VERSION'];log=(r/'logs/kernel-build.log').read_text(errors='replace')
+         assert f'KernelSU version: {version}' in log,'Actual Kbuild did not use derived source version'
+         assert '-DKSU_VERSION=16' not in log and 'KSU_GIT_VERSION not defined!' not in log
+         (r/'Official-compiled-version-check.json').write_text(json.dumps({'expected':version,'Kbuild_log_verified':True,'fallback_warning_absent':True,'disassembly_saved':True,'runtime_Manager_tested':False},indent=2)+'\n')
         targets={};symvers={}
         for line in (r/'Module.symvers').read_text().splitlines():
          f=line.split()
@@ -281,7 +349,7 @@ jobs:
         (r/'config-from-Image-verified.txt').write_text('All six requested features + Official KSU + MODVERSIONS/MODULE_SIG/PROTECT verified from actual Image.\n')
         (r/'result.json').write_text(json.dumps({'Image_sha256':hashlib.sha256(b).hexdigest(),'final_config_sha256':hashlib.sha256(cfg).hexdigest(),'compilation_exit':(r/'compile-exit-code.txt').read_text().strip() if (r/'compile-exit-code.txt').exists() else 'UNKNOWN','upstream_ABI_exit':(r/'upstream-abi-exit-code.txt').read_text().strip() if (r/'upstream-abi-exit-code.txt').exists() else 'NOT_RUN','OEM_acceptance':'NOT_ACCEPTED: full stock CRC/BTF/trust offline audit remains required','all_reject_count':len(rejects)},indent=2)+'\n')
         PY
-    - name: Package only AnyKernel3.zip; never create boot images or a Release
+    - name: Package only AnyKernel3 ZIP; never execute installation or create a Release
       if: steps.compile.outcome == 'success' && steps.collect.outcome == 'success'
       shell: bash
       run: |

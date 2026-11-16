@@ -31,7 +31,7 @@ jobs:
          f.write('android_version=android14\nsub_level=138\nkernel_full=6.1.138\n')
         print(json.dumps({'resolved':'android14 / 6.1.138','parameters':actual},ensure_ascii=False,indent=2))
         PY
-    if: 'github.event_name == ''workflow_dispatch'' || github.event.head_commit.message == ''muyu678: controlled 6.1.138 experiment 20261116 startup fix'''
+    if: 'github.event_name == ''workflow_dispatch'' || github.event.head_commit.message == ''muyu678: OEM public trust and truthful Official metadata experiment 20261116'''
   build-custom-kernel:
     name: ${{ needs.resolve-version.outputs.kernel_full }}-${{ needs.resolve-version.outputs.android_version }}-${{ inputs.os_patch_level }}
     needs: resolve-version
